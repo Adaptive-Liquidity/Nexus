@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
         timeout_ms: 500,
         management_key: Some(management_key),
         hmac_key: Some(hmac_key),
+        verifying_key: None,
     };
     let hypervisor = NexusHypervisor::new(HypervisorConfig {
         aeon_config: Some(aeon),

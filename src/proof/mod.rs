@@ -2,6 +2,7 @@
 
 pub mod canonical;
 pub mod digest;
+pub mod dsse;
 pub mod receipt;
 pub mod redaction;
 pub mod schema;

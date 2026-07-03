@@ -23,7 +23,9 @@ pub enum ProofSigningConfig {
 }
 
 impl ProofSigningConfig {
-    pub(crate) fn signing_key(&self) -> Result<SigningKey> {
+    /// Resolve the signing key.  Public so offline tooling (e.g. the
+    /// `nexus aeon export-dsse` CLI) can load the provisioned proof key.
+    pub fn signing_key(&self) -> Result<SigningKey> {
         match self {
             ProofSigningConfig::EphemeralDedicated => Ok(SigningKey::generate(&mut OsRng)),
             ProofSigningConfig::FromEnv(var) => signing_key_from_env(var),

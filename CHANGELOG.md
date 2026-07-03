@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **C2 resolved**: AEON-IQ now Ed25519 counter-signs the hit set it serves
+  (`evidence` envelope on `POST /api/v1/memories/search`); Nexus verifies it in
+  `search_with_status` when `NEXUS_AEON_VERIFYING_KEY` is configured. A missing,
+  wrong-key, or invalid signature drops the hits and degrades the outcome.
+  `attach_memory_evidence_from_receipt` upgrades `Advisory` → `Attested` only
+  when the in-process recall verified the counter-signature; daemon wire callers
+  cannot claim verification they did not perform. (The original C2 note said
+  "HMAC counter-signature" — the shipped scheme is Ed25519, so only the public
+  verifying key needs distributing to consumers.)
+
+### Added
+- `NEXUS_AEON_VERIFYING_KEY` (hex, 32 bytes): AEON-IQ's evidence verifying key.
+  Counterpart provisioning: AEON-IQ `AEON_EVIDENCE_SIGNING_KEY` and
+  `GET /api/v1/evidence/verifying-key`. See docs/AEON_NEXUS_KEY_PROVISIONING.md.
+- `ExecutionReceipt.aeon_memory_evidence_verified` /
+  `ToolDefinition.with_aeon_memory_evidence_verified` (aeon-memory feature).
+
 ## [1.0.0] - 2026-06-21
 
 ### Security
@@ -30,28 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `nexus aeon incident` CLI subcommand generates a structured incident report from a
   `ProofCapsule` JSON file.
 
-
-### Security
-- **C2**: Downgrade self-issued memory evidence from `Attested` to `Advisory` in
-  `attach_memory_evidence_from_receipt` — the digest-only daemon path cannot verify hit count
-  or a counter-signed AEON-IQ receipt; `Attested` will be reinstated in P11 when
-  counter-signature verification is added.
-- **M1**: Add `MemoryRecall` capability variant with gate before `recall_memory_evidence_v1`
-  in the `nexus_iq_execute` MCP path — memory recall now requires an explicit
-  `nexus:memory_recall` capability token.
-
-### Fixed
-- **C1**: `nexus_iq_execute` MCP handler now correctly recognises
-  `AttestedNoHit` and `AttestedWithRecall` modes when extracting the memory digest
-  (match arm previously only covered `Attested`; `memory_digest` was always `None`
-  for the other two modes).
-- **H1**: `NexusIqExecuteResponse` now serialises `MemoryEvidenceForMcp` (omits raw query
-  text) instead of the full `MemoryEvidenceV1` — prevents caller-visible leakage of the
-  search query via MCP responses.
-
-### Added
-- **L2**: `nexus aeon verify-capsule` CLI subcommand validates that a `ProofCapsule` JSON
-  has consistent `memory_mode` and `memory_evidence` fields.
 
 ## [0.2.0] - 2026-06-20
 
