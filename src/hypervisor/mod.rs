@@ -365,21 +365,12 @@ impl NexusHypervisor {
 
         let capability_manager = CapabilityManager::new();
         let proof_signing_key = config.proof_signing.signing_key()?;
+        // Optional AEON construction routes through the shared helper so the
+        // degrade-vs-fatal decision (honoring NEXUS_AEON_REQUIRED) is identical
+        // across every call site (issue #169).
         #[cfg(feature = "aeon-memory")]
         let aeon_memory = match config.aeon_config.as_ref() {
-            Some(aeon_config) => {
-                match crate::aeon::AeonMemoryClient::from_enabled_config(aeon_config) {
-                    Ok(aeon_memory) => aeon_memory,
-                    Err(error) => {
-                        tracing::error!(
-                            target: "nexus.aeon",
-                            error = %error,
-                            "AEON optional construction failed; continuing with AEON disabled"
-                        );
-                        None
-                    }
-                }
-            }
+            Some(aeon_config) => crate::aeon::init_aeon_memory_client(aeon_config)?,
             None => None,
         };
 

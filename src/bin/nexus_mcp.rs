@@ -1040,7 +1040,7 @@ impl NexusMcpServer {
         let aeon_config = nexus::aeon::AeonConfig::from_env().ok();
         let memory_client = if params.memory_query.is_some() {
             match aeon_config.as_ref().filter(|c| c.hmac_key.is_some()) {
-                Some(config) => nexus::aeon::AeonMemoryClient::from_enabled_config(config)?,
+                Some(config) => nexus::aeon::init_aeon_memory_client(config)?,
                 None => None,
             }
         } else {
