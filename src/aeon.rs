@@ -282,6 +282,11 @@ pub struct AeonMemoryClient {
     base_url: String,
     policy: EgressPolicy,
     agent_id: String,
+    /// Session filter sent with every search request (from `AeonConfig::session_id`
+    /// / `NEXUS_AEON_SESSION_ID`). Must be threaded into both the request body
+    /// and the payload reconstructed for signature verification — AEON-IQ signs
+    /// exactly what it was asked for and served, so the two must agree byte-for-byte.
+    session_id: Option<String>,
     management_key: Option<String>,
     verifying_key: Option<[u8; 32]>,
     #[cfg(test)]
@@ -303,6 +308,7 @@ impl AeonMemoryClient {
             base_url: config.base_url.trim_end_matches('/').to_string(),
             policy: Self::egress_policy(config)?,
             agent_id: config.agent_id.clone(),
+            session_id: config.session_id.clone(),
             management_key: config.management_key.clone(),
             verifying_key: config.verifying_key,
             #[cfg(test)]
@@ -372,6 +378,7 @@ impl AeonMemoryClient {
             agent_id: &self.agent_id,
             query,
             limit,
+            session_id: self.session_id.as_deref(),
         };
 
         let response = match self.post_json(url, management_key, &body).await {
@@ -654,7 +661,10 @@ impl AeonMemoryClient {
         let payload = EvidencePayloadMirror {
             version: EVIDENCE_SIG_VERSION,
             agent_id: &self.agent_id,
-            session_id: None,
+            // Must match exactly what was sent in the SearchRequest — AEON-IQ
+            // signs the session_id it actually received and filtered on, not
+            // a fixed value.
+            session_id: self.session_id.as_deref(),
             hit_ids: body
                 .results
                 .iter()
@@ -1461,6 +1471,8 @@ struct SearchRequest<'a> {
     agent_id: &'a str,
     query: &'a str,
     limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -2020,13 +2032,23 @@ mod tests {
     /// Build a client with a pinned verifying key and a responder that
     /// returns `body`.
     fn verifying_mock_client(signing_seed: [u8; 32], body: String) -> AeonMemoryClient {
+        verifying_mock_client_with_session(signing_seed, None, body)
+    }
+
+    fn verifying_mock_client_with_session(
+        signing_seed: [u8; 32],
+        session_id: Option<&str>,
+        body: String,
+    ) -> AeonMemoryClient {
         use ed25519_dalek::SigningKey;
         let vk = SigningKey::from_bytes(&signing_seed)
             .verifying_key()
             .to_bytes();
+        let session_id = session_id.map(str::to_string);
         with_clean_aeon_env(|| {
             let mut config = test_config("http://aeon.test", Some("mgmt"));
             config.verifying_key = Some(vk);
+            config.session_id = session_id.clone();
             AeonMemoryClient::with_test_responder(
                 &config,
                 Arc::new(move |_request| TestHttpResponse {
@@ -2040,12 +2062,21 @@ mod tests {
     /// Sign a hit set exactly as AEON-IQ's attestation.rs does and return the
     /// full search-response JSON body.
     fn signed_search_body(signing_seed: [u8; 32], agent_id: &str, hits: &[(&str, &str)]) -> String {
+        signed_search_body_with_session(signing_seed, agent_id, None, hits)
+    }
+
+    fn signed_search_body_with_session(
+        signing_seed: [u8; 32],
+        agent_id: &str,
+        session_id: Option<&str>,
+        hits: &[(&str, &str)],
+    ) -> String {
         use ed25519_dalek::{Signer, SigningKey};
         let key = SigningKey::from_bytes(&signing_seed);
         let payload = EvidencePayloadMirror {
             version: EVIDENCE_SIG_VERSION,
             agent_id,
-            session_id: None,
+            session_id,
             hit_ids: hits.iter().map(|(id, _)| id.to_string()).collect(),
             hit_content_digests: hits
                 .iter()
@@ -2132,6 +2163,86 @@ mod tests {
 
         let outcome = client.search_with_status("query", 5).await;
         assert!(outcome.hits.is_empty());
+        assert_eq!(
+            outcome.attestation,
+            crate::proof::schema::MemoryAttestationMode::Degraded
+        );
+    }
+
+    /// A session-scoped client sends its session_id in the search request and
+    /// correctly verifies a signature AEON-IQ produced over that same
+    /// session_id — regression test for the bug where verification always
+    /// reconstructed the payload with session_id hardcoded to None.
+    #[tokio::test]
+    async fn session_scoped_signature_verifies() {
+        let seed = [9u8; 32];
+        let body =
+            signed_search_body_with_session(seed, "agent-1", Some("sess-1"), &[("id-1", "hello")]);
+        let client = verifying_mock_client_with_session(seed, Some("sess-1"), body);
+
+        let outcome = client.search_with_status("query", 5).await;
+        assert_eq!(
+            outcome.hits.len(),
+            1,
+            "session-scoped signature must verify"
+        );
+        assert_eq!(
+            outcome.attestation,
+            crate::proof::schema::MemoryAttestationMode::AttestedWithRecall
+        );
+    }
+
+    /// The session_id configured on the client is actually sent in the
+    /// search request body, not silently dropped.
+    #[tokio::test]
+    async fn session_id_is_sent_in_search_request() {
+        use std::sync::Mutex;
+
+        let seed = [9u8; 32];
+        let body =
+            signed_search_body_with_session(seed, "agent-1", Some("sess-1"), &[("id-1", "hello")]);
+        let captured: Arc<Mutex<Option<TestHttpRequest>>> = Arc::new(Mutex::new(None));
+        let captured_for_responder = Arc::clone(&captured);
+
+        use ed25519_dalek::SigningKey;
+        let vk = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let client = with_clean_aeon_env(|| {
+            let mut config = test_config("http://aeon.test", Some("mgmt"));
+            config.verifying_key = Some(vk);
+            config.session_id = Some("sess-1".to_string());
+            AeonMemoryClient::with_test_responder(
+                &config,
+                Arc::new(move |request| {
+                    *captured_for_responder.lock().unwrap() = Some(request);
+                    TestHttpResponse {
+                        status: 200,
+                        body: body.clone(),
+                    }
+                }),
+            )
+        });
+
+        let _ = client.search_with_status("query", 5).await;
+        let request = captured.lock().unwrap().take().expect("request captured");
+        let parsed: Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(parsed["session_id"], "sess-1");
+    }
+
+    /// A response signed for a different session than the client is
+    /// configured for must fail verification, even though the hit content
+    /// itself is untampered — the session filter is part of what's attested.
+    #[tokio::test]
+    async fn session_mismatch_degrades() {
+        let seed = [9u8; 32];
+        let body =
+            signed_search_body_with_session(seed, "agent-1", Some("sess-2"), &[("id-1", "hello")]);
+        let client = verifying_mock_client_with_session(seed, Some("sess-1"), body);
+
+        let outcome = client.search_with_status("query", 5).await;
+        assert!(
+            outcome.hits.is_empty(),
+            "session-mismatched signature must not verify"
+        );
         assert_eq!(
             outcome.attestation,
             crate::proof::schema::MemoryAttestationMode::Degraded
