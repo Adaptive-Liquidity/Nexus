@@ -173,6 +173,19 @@ enum AeonCmd {
         /// Path to a ProofCapsule JSON file, or "-" for stdin.
         capsule: PathBuf,
     },
+    /// Export a ProofCapsule JSON file as a signed DSSE envelope
+    /// (payloadType application/vnd.nexus.proof-capsule+json) for in-toto /
+    /// supply-chain tooling. Requires the provisioned proof signing key.
+    ExportDsse {
+        /// Path to a ProofCapsule JSON file, or "-" for stdin.
+        capsule: PathBuf,
+        /// Env var holding the base64-encoded 32-byte proof signing seed.
+        #[arg(long, default_value = "NEXUS_PROOF_SIGNING_KEY")]
+        signing_key_env: String,
+        /// Output file (stdout when omitted).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Verify a MemoryEvidenceV1 bundle: invariant check + optional signature verification.
     VerifyCapsule {
         /// Capsule ID to associate with the evidence.
@@ -324,6 +337,11 @@ fn run_aeon(cmd: AeonCmd) -> anyhow::Result<()> {
             }
         }
         AeonCmd::VerifyProofCapsule { capsule } => run_iq_verify(&capsule)?,
+        AeonCmd::ExportDsse {
+            capsule,
+            signing_key_env,
+            output,
+        } => run_aeon_export_dsse(&capsule, &signing_key_env, output.as_deref())?,
         AeonCmd::VerifyCapsule {
             capsule_id,
             evidence_file,
@@ -332,6 +350,48 @@ fn run_aeon(cmd: AeonCmd) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[cfg(feature = "aeon-memory")]
+fn run_aeon_export_dsse(
+    capsule_path: &std::path::Path,
+    signing_key_env: &str,
+    output: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    use nexus::proof::dsse;
+    use nexus::proof::schema::ProofCapsule;
+    use nexus::proof::signing::ProofSigningConfig;
+    use std::io::Read as _;
+
+    let json = if capsule_path == std::path::Path::new("-") {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(capsule_path)?
+    };
+    let capsule: ProofCapsule = serde_json::from_str(&json)
+        .map_err(|e| anyhow::anyhow!("failed to parse ProofCapsule: {e}"))?;
+
+    let key = ProofSigningConfig::FromEnv(signing_key_env.to_string())
+        .signing_key()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot load proof signing key from ${signing_key_env}: {e}.                  DSSE export requires the provisioned (non-ephemeral) proof key."
+            )
+        })?;
+
+    let envelope = dsse::wrap_capsule(&capsule, &key)?;
+    let rendered = serde_json::to_string_pretty(&envelope)?;
+    match output {
+        Some(path) => std::fs::write(path, rendered)?,
+        None => println!("{rendered}"),
+    }
+    eprintln!(
+        "DSSE envelope written (keyid {})",
+        envelope.signatures[0].keyid
+    );
     Ok(())
 }
 
