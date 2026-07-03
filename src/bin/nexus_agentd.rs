@@ -730,13 +730,18 @@ fn queue_timeline_delivery(
     let session_id = session_id.map(str::to_string);
     let mode = nexus::aeon::TimelineDeliveryMode::parse(mode);
     let config = nexus::aeon::AeonConfig::from_env().unwrap_or_default();
+    // Preserve the two load-bearing invariants: the Offline branch uses the
+    // unconditional offline helper (so spooling still works without an enabled
+    // config), and `mode` is always threaded into `.with_mode` (never dropped).
+    // Both route through the shared init helpers (issue #169).
     let sink = if matches!(mode, nexus::aeon::TimelineDeliveryMode::Offline) {
-        match nexus::aeon::AeonTimelineSink::from_config(&config) {
-            Ok(sink) => Some(sink.with_mode(mode)),
+        match nexus::aeon::init_aeon_timeline_sink_offline(&config) {
+            Ok(Some(sink)) => Some(sink.with_mode(mode)),
+            Ok(None) => None,
             Err(_) => return Some(nexus::aeon::TimelineDeliveryStatus::FailedOpen),
         }
     } else {
-        match nexus::aeon::AeonTimelineSink::from_enabled_config(&config) {
+        match nexus::aeon::init_aeon_timeline_sink(&config) {
             Ok(Some(sink)) => Some(sink.with_mode(mode)),
             Ok(None) => None,
             Err(_) => return Some(nexus::aeon::TimelineDeliveryStatus::FailedOpen),

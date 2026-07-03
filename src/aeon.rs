@@ -27,6 +27,10 @@ const TIMEOUT_MS_ENV: &str = "NEXUS_AEON_TIMEOUT_MS";
 const MANAGEMENT_KEY_ENV: &str = "NEXUS_AEON_MANAGEMENT_KEY";
 const HMAC_KEY_ENV: &str = "NEXUS_AEON_HMAC_KEY";
 const VERIFYING_KEY_ENV: &str = "NEXUS_AEON_VERIFYING_KEY";
+/// When truthy, optional-AEON construction errors (invalid egress config, client
+/// build failure) become **fatal** instead of degrading to disabled. This is the
+/// sole fatal path — see `aeon_required` / `init_aeon_memory_client`.
+const REQUIRED_ENV: &str = "NEXUS_AEON_REQUIRED";
 /// Version tag of the AEON-IQ evidence counter-signature scheme this client
 /// can verify.  Must match AEON-IQ's `attestation::EVIDENCE_SIG_VERSION`.
 const EVIDENCE_SIG_VERSION: &str = "aeon-evidence-sig-v1";
@@ -148,6 +152,63 @@ impl AeonConfig {
             "{}/v1/chat/completions",
             self.base_url.trim_end_matches('/')
         )
+    }
+}
+
+/// True when `NEXUS_AEON_REQUIRED` is set truthy. When required, optional-AEON
+/// construction errors propagate instead of degrading to disabled. A malformed
+/// value is treated as not-required (this reads a gate, never fails startup).
+pub fn aeon_required() -> bool {
+    env_bool(REQUIRED_ENV, false).unwrap_or(false)
+}
+
+/// Shared decision for every optional-AEON init call site: on a construction
+/// error, either propagate it (when `NEXUS_AEON_REQUIRED=true` — the *only*
+/// fatal path) or log once and degrade to `None`. Using one helper everywhere is
+/// exactly the unification issue #169 asks for; keeping the `Result` return (not
+/// `unwrap_or_default()`) is what preserves the required-fatal invariant that the
+/// reverted attempt (#166) broke.
+fn degrade_or_fail<T>(what: &str, error: NexusError) -> Result<Option<T>> {
+    if aeon_required() {
+        Err(error)
+    } else {
+        warn!(
+            target: "nexus.aeon",
+            error = %error,
+            "{what} construction failed; continuing with AEON disabled (set NEXUS_AEON_REQUIRED=true to make this fatal)"
+        );
+        Ok(None)
+    }
+}
+
+/// Construct an optional AEON memory client from config, honoring
+/// `NEXUS_AEON_REQUIRED`. Returns `Ok(None)` when AEON is not fully configured,
+/// or when construction fails and AEON is not required. Returns `Err` only when
+/// construction fails **and** AEON is required.
+pub fn init_aeon_memory_client(config: &AeonConfig) -> Result<Option<AeonMemoryClient>> {
+    match AeonMemoryClient::from_enabled_config(config) {
+        Ok(client) => Ok(client),
+        Err(error) => degrade_or_fail("AEON memory client", error),
+    }
+}
+
+/// Optional AEON timeline sink for the enabled (Advisory/Attested) path, honoring
+/// `NEXUS_AEON_REQUIRED`. Mirrors `init_aeon_memory_client`.
+pub fn init_aeon_timeline_sink(config: &AeonConfig) -> Result<Option<AeonTimelineSink>> {
+    match AeonTimelineSink::from_enabled_config(config) {
+        Ok(sink) => Ok(sink),
+        Err(error) => degrade_or_fail("AEON timeline sink", error),
+    }
+}
+
+/// Optional AEON timeline sink for the **Offline** path. Uses the unconditional
+/// `from_config` (never the enabled-config gate) so spooling still works when the
+/// management key / enabled flag are absent — preserving the offline-spooling
+/// invariant the reverted attempt broke. Still honors `NEXUS_AEON_REQUIRED`.
+pub fn init_aeon_timeline_sink_offline(config: &AeonConfig) -> Result<Option<AeonTimelineSink>> {
+    match AeonTimelineSink::from_config(config) {
+        Ok(sink) => Ok(Some(sink)),
+        Err(error) => degrade_or_fail("AEON offline timeline sink", error),
     }
 }
 
@@ -923,6 +984,11 @@ impl AeonTimelineSink {
 
         let mut report = TimelineReplayReport::default();
         let mut retained = Vec::new();
+        // Events already delivered (or dropped as duplicates) in this replay pass,
+        // so a record that was duplicated on disk is delivered at most once and
+        // its copies are dropped rather than retained (issue #168).
+        let mut seen_event_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
             let record = match serde_json::from_str::<TimelineSpoolRecord>(line) {
@@ -943,6 +1009,15 @@ impl AeonTimelineSink {
                 report.skipped += 1;
                 retained.push(line.to_string());
                 continue;
+            }
+
+            // Drop a duplicate of an event already handled this pass — do not
+            // retain it and do not re-deliver it.
+            if let Some(id) = &record.event_id {
+                if !seen_event_ids.insert(id.clone()) {
+                    report.skipped += 1;
+                    continue;
+                }
             }
 
             let mut event = record.event;
@@ -974,11 +1049,21 @@ impl AeonTimelineSink {
         session_id: Option<&str>,
         events: &[crate::daemon::NexusExecutionEvent],
     ) -> bool {
-        let records = events.iter().map(|event| TimelineSpoolRecord {
-            created_at: Utc::now(),
-            agent_id: agent_id.to_string(),
-            event: TimelineEventBody::from_event(session_id, event),
+        let records = events.iter().map(|event| {
+            let body = TimelineEventBody::from_event(session_id, event);
+            let event_id = timeline_event_id(agent_id, &body);
+            TimelineSpoolRecord {
+                created_at: Utc::now(),
+                agent_id: agent_id.to_string(),
+                event_id: Some(event_id),
+                event: body,
+            }
         });
+
+        // Append-if-absent: skip any event already durably spooled so a retry
+        // after a flush that failed (but whose append succeeded) does not
+        // duplicate the record (issue #168).
+        let mut seen = read_spooled_event_ids(&self.spool_path).await;
 
         if let Some(parent) = self.spool_path.parent() {
             if let Err(error) = tokio::fs::create_dir_all(parent).await {
@@ -1009,6 +1094,13 @@ impl AeonTimelineSink {
         };
 
         for record in records {
+            if let Some(id) = &record.event_id {
+                if !seen.insert(id.clone()) {
+                    // Already spooled (either pre-existing on disk or a duplicate
+                    // within this same batch) — idempotent skip.
+                    continue;
+                }
+            }
             let mut bytes = match serde_json::to_vec(&record) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -1031,13 +1123,16 @@ impl AeonTimelineSink {
             }
         }
 
+        // Flush is best-effort: the append above is the durable-enqueue success.
+        // A flush error no longer reports failure (which previously drove a retry
+        // that re-appended the same records) — the append-if-absent guard above
+        // makes any such retry idempotent regardless (issue #168).
         if let Err(error) = tokio::io::AsyncWriteExt::flush(&mut file).await {
             debug!(
                 target: "nexus.aeon",
                 error = %error,
-                "AEON-IQ timeline spool flush failed; failing open"
+                "AEON-IQ timeline spool flush failed (records already enqueued; treating as durable)"
             );
-            return false;
         }
 
         true
@@ -1241,7 +1336,48 @@ impl AeonTimelineSink {
 struct TimelineSpoolRecord {
     created_at: DateTime<Utc>,
     agent_id: String,
+    /// Stable, content-derived identity used to dedup a re-spooled event (see
+    /// `timeline_event_id`). `Option` for backward compatibility with spool files
+    /// written before this field existed — legacy records (`None`) are never
+    /// deduped and always processed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_id: Option<String>,
     event: TimelineEventBody,
+}
+
+/// Deterministic identity for a timeline event, derived only from its
+/// identifying content (not the wall-clock `created_at`). A retried delivery of
+/// the same logical event therefore produces the same id, so append-if-absent
+/// spooling and replay dedup make re-spooling idempotent (issue #168). The
+/// `\u{1f}` (unit separator) delimiter cannot appear in these hex/uuid/enum
+/// fields, so distinct events cannot collide.
+fn timeline_event_id(agent_id: &str, body: &TimelineEventBody) -> String {
+    let seed = format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        agent_id,
+        body.session_id.as_deref().unwrap_or(""),
+        body.event_type,
+        body.nexus_snapshot_id.as_deref().unwrap_or(""),
+        body.capsule_digest.as_deref().unwrap_or(""),
+    );
+    sha256_hex(seed.as_bytes())
+}
+
+/// Read the set of `event_id`s already present in the spool file, so
+/// `spool_events` can append only records not already durably written (the
+/// idempotency guard that makes a retry-after-partial-flush a no-op).
+async fn read_spooled_event_ids(path: &Path) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    if let Ok(content) = tokio::fs::read_to_string(path).await {
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            if let Ok(record) = serde_json::from_str::<TimelineSpoolRecord>(line) {
+                if let Some(id) = record.event_id {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    ids
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1658,7 +1794,7 @@ mod tests {
 
     static AEON_ENV_LOCK: Mutex<()> = Mutex::new(());
     static EGRESS_ENV_LOCK: Mutex<()> = Mutex::new(());
-    const AEON_ENV_VARS: [&str; 11] = [
+    const AEON_ENV_VARS: [&str; 12] = [
         ENABLED_ENV,
         BASE_URL_ENV,
         AGENT_ID_ENV,
@@ -1667,6 +1803,7 @@ mod tests {
         MANAGEMENT_KEY_ENV,
         HMAC_KEY_ENV,
         VERIFYING_KEY_ENV,
+        REQUIRED_ENV,
         TIMELINE_SPOOL_ENV,
         "NEXUS_EGRESS_ALLOWLIST",
         "NEXUS_EGRESS_ALLOW_PRIVATE",
@@ -2012,6 +2149,55 @@ mod tests {
         });
     }
 
+    /// #167/#169: with an invalid optional-AEON egress config and AEON *not*
+    /// required, the shared init helper degrades to `Ok(None)` rather than
+    /// propagating the error — so `nexus_iq_execute` (and every other call site)
+    /// keeps working with AEON disabled instead of aborting.
+    #[test]
+    fn init_aeon_memory_client_degrades_on_invalid_egress_when_not_required() {
+        with_clean_aeon_env(|| {
+            std::env::set_var("NEXUS_EGRESS_ALLOW_PRIVATE", "not-a-bool");
+            // NEXUS_AEON_REQUIRED unset → not required.
+            let result = init_aeon_memory_client(&test_config("http://127.0.0.1:1", Some("mgmt")));
+            assert!(
+                matches!(result, Ok(None)),
+                "expected degrade to Ok(None), got is_ok={}",
+                result.is_ok()
+            );
+        });
+    }
+
+    /// #169 invariant 1: the same invalid config becomes **fatal** (propagates
+    /// `Err`) when `NEXUS_AEON_REQUIRED=true`. This is exactly what the reverted
+    /// attempt broke by wrapping the required path in `unwrap_or_default()`.
+    #[test]
+    fn init_aeon_memory_client_fails_when_required() {
+        with_clean_aeon_env(|| {
+            std::env::set_var("NEXUS_EGRESS_ALLOW_PRIVATE", "not-a-bool");
+            std::env::set_var(REQUIRED_ENV, "true");
+            let result = init_aeon_memory_client(&test_config("http://127.0.0.1:1", Some("mgmt")));
+            assert!(result.is_err(), "required mode must be fatal");
+        });
+    }
+
+    /// #169 invariant 2: the offline init helper builds a spooling sink via the
+    /// unconditional `from_config`, even when the enabled-config gate is not met
+    /// (no management key) — so offline spooling never silently degrades to a
+    /// non-spooling `None`.
+    #[test]
+    fn init_aeon_timeline_sink_offline_builds_without_management_key() {
+        with_clean_aeon_env(|| {
+            let mut config = test_config("http://aeon.test", None);
+            config.enabled = false;
+            let sink = init_aeon_timeline_sink_offline(&config)
+                .expect("offline sink build must not error")
+                .expect("offline sink must be Some even without management key");
+            // The enabled path, by contrast, yields None for the same config.
+            assert!(init_aeon_timeline_sink(&config).unwrap().is_none());
+            let _ = sink; // constructed successfully
+        });
+    }
+
     fn test_config(base_url: &str, management_key: Option<&str>) -> AeonConfig {
         AeonConfig {
             enabled: true,
@@ -2291,7 +2477,7 @@ mod tests {
 
     fn with_clean_aeon_env<R>(test: impl FnOnce() -> R + std::panic::UnwindSafe) -> R {
         let _guard = AEON_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let saved: [(&str, Option<OsString>); 11] =
+        let saved: [(&str, Option<OsString>); 12] =
             AEON_ENV_VARS.map(|name| (name, std::env::var_os(name)));
 
         for name in AEON_ENV_VARS {
@@ -2609,6 +2795,64 @@ mod tests {
             }
         );
         assert_eq!(second, TimelineReplayReport::default());
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    /// #168: spooling the same logical event twice (e.g. a retry after a flush
+    /// that failed but whose append succeeded) must be idempotent — the spool
+    /// holds exactly one record, and replay delivers it exactly once.
+    #[tokio::test]
+    async fn aeon_timeline_spool_is_idempotent_for_duplicate_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = tmp.path().join("timeline.jsonl");
+        let offline = with_clean_egress_env(|| {
+            AeonTimelineSink::from_config(&test_config("http://aeon.test", Some("mgmt-key")))
+                .unwrap()
+                .with_mode(TimelineDeliveryMode::Offline)
+                .with_spool_path(&spool)
+        });
+        let event = [NexusExecutionEvent::ProofCapsuleEmitted {
+            capsule_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440042").unwrap(),
+        }];
+
+        // Deliver the identical event twice — the second is the "retry".
+        assert_eq!(
+            offline.deliver("agent-1", Some("session-1"), &event).await,
+            TimelineDeliveryStatus::FireAndForget
+        );
+        assert_eq!(
+            offline.deliver("agent-1", Some("session-1"), &event).await,
+            TimelineDeliveryStatus::FireAndForget
+        );
+
+        // Append-if-absent: exactly one record on disk despite two deliveries.
+        let contents = std::fs::read_to_string(&spool).unwrap();
+        assert_eq!(
+            contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            1,
+            "duplicate event must not be re-spooled"
+        );
+
+        // Replay delivers it exactly once (responder called once).
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_responder = Arc::clone(&captured);
+        let online = AeonTimelineSink::with_test_responder(
+            &test_config("http://aeon.test", Some("mgmt-key")),
+            Arc::new(move |request| {
+                captured_for_responder.lock().unwrap().push(request);
+                TestHttpResponse {
+                    status: 200,
+                    body: "{}".to_string(),
+                }
+            }),
+        )
+        .with_spool_path(&spool);
+
+        let report = online.replay_spooled_events("agent-1", None).await;
+        assert_eq!(report.delivered, 1);
         assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
