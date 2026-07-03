@@ -26,6 +26,10 @@ const SESSION_ID_ENV: &str = "NEXUS_AEON_SESSION_ID";
 const TIMEOUT_MS_ENV: &str = "NEXUS_AEON_TIMEOUT_MS";
 const MANAGEMENT_KEY_ENV: &str = "NEXUS_AEON_MANAGEMENT_KEY";
 const HMAC_KEY_ENV: &str = "NEXUS_AEON_HMAC_KEY";
+const VERIFYING_KEY_ENV: &str = "NEXUS_AEON_VERIFYING_KEY";
+/// Version tag of the AEON-IQ evidence counter-signature scheme this client
+/// can verify.  Must match AEON-IQ's `attestation::EVIDENCE_SIG_VERSION`.
+const EVIDENCE_SIG_VERSION: &str = "aeon-evidence-sig-v1";
 const TIMELINE_SPOOL_ENV: &str = "NEXUS_AEON_TIMELINE_SPOOL";
 const TIMELINE_MAX_ATTEMPTS: usize = 3;
 static MISSING_MANAGEMENT_KEY_WARN: Once = Once::new();
@@ -42,6 +46,12 @@ pub struct AeonConfig {
     /// Hex-encoded HMAC-SHA256 key shared with AEON-IQ for memory evidence binding.
     /// When absent, `build_memory_evidence_ref` returns `Absent` mode with no evidence.
     pub hmac_key: Option<Vec<u8>>,
+    /// AEON-IQ's Ed25519 evidence verifying key (hex, 32 bytes) from
+    /// `NEXUS_AEON_VERIFYING_KEY`.  When set, search responses MUST carry a
+    /// valid counter-signature over the served hit set or the outcome is
+    /// `Degraded` with no hits; when unset, legacy presence-based attestation
+    /// applies (see `search_with_status`).  Public material — safe to log.
+    pub verifying_key: Option<[u8; 32]>,
 }
 
 impl std::fmt::Debug for AeonConfig {
@@ -63,6 +73,10 @@ impl std::fmt::Debug for AeonConfig {
                     .as_ref()
                     .map(|key| format!("[REDACTED {} bytes]", key.len())),
             )
+            .field(
+                "verifying_key",
+                &self.verifying_key.as_ref().map(|key| hex_lower(key)),
+            )
             .finish()
     }
 }
@@ -77,6 +91,7 @@ impl Default for AeonConfig {
             timeout_ms: 30_000,
             management_key: None,
             hmac_key: None,
+            verifying_key: None,
         }
     }
 }
@@ -106,6 +121,14 @@ impl AeonConfig {
             timeout_ms: env_u64(TIMEOUT_MS_ENV, defaults.timeout_ms)?,
             management_key: env_optional_string(MANAGEMENT_KEY_ENV)?,
             hmac_key: env_optional_hex(HMAC_KEY_ENV)?,
+            verifying_key: match env_optional_hex(VERIFYING_KEY_ENV)? {
+                None => None,
+                Some(bytes) => Some(bytes.as_slice().try_into().map_err(|_| {
+                    NexusError::ConfigError(format!(
+                        "{VERIFYING_KEY_ENV} must decode to exactly 32 bytes (Ed25519 public key)"
+                    ))
+                })?),
+            },
         };
         if let Some(ref key) = config.hmac_key {
             if key.len() < 32 {
@@ -260,6 +283,7 @@ pub struct AeonMemoryClient {
     policy: EgressPolicy,
     agent_id: String,
     management_key: Option<String>,
+    verifying_key: Option<[u8; 32]>,
     #[cfg(test)]
     test_responder: Option<TestResponder>,
 }
@@ -280,6 +304,7 @@ impl AeonMemoryClient {
             policy: Self::egress_policy(config)?,
             agent_id: config.agent_id.clone(),
             management_key: config.management_key.clone(),
+            verifying_key: config.verifying_key,
             #[cfg(test)]
             test_responder: None,
         })
@@ -373,6 +398,21 @@ impl AeonMemoryClient {
 
         match serde_json::from_str::<SearchResponse>(&response.body) {
             Ok(body) => {
+                // With a verifying key configured, AEON-IQ's Ed25519
+                // counter-signature over the served hit set MUST verify —
+                // otherwise the hits are treated as untrustworthy (possible
+                // in-transit/at-rest tampering) and dropped.  Without a key,
+                // legacy presence-based attestation applies unchanged.
+                if self.verifying_key.is_some() && !self.evidence_signature_ok(&body) {
+                    debug!(
+                        target: "nexus.aeon",
+                        "AEON-IQ evidence counter-signature missing or invalid;                          dropping hits and degrading attestation"
+                    );
+                    return MemorySearchOutcome {
+                        hits: Vec::new(),
+                        attestation: MemoryAttestationMode::Degraded,
+                    };
+                }
                 let hits = body
                     .results
                     .into_iter()
@@ -576,6 +616,60 @@ impl AeonMemoryClient {
                 None
             }
         }
+    }
+
+    /// True when this client requires (and can check) evidence signatures.
+    pub fn verifies_evidence(&self) -> bool {
+        self.verifying_key.is_some()
+    }
+
+    /// Verify AEON-IQ's Ed25519 counter-signature over the served hit set.
+    /// Reconstructs the canonical payload from the parsed response exactly as
+    /// AEON-IQ built it (see AEON-IQ `src/attestation.rs`): recursive
+    /// key-sorted JSON of {version, agent_id, session_id, hit_ids,
+    /// hit_content_digests}.
+    fn evidence_signature_ok(&self, body: &SearchResponse) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let Some(key_bytes) = self.verifying_key else {
+            return false;
+        };
+        let Some(envelope) = body.evidence.as_ref() else {
+            return false;
+        };
+        if envelope.version != EVIDENCE_SIG_VERSION {
+            return false;
+        }
+        if !envelope.key_id.eq_ignore_ascii_case(&hex_lower(&key_bytes)) {
+            return false;
+        }
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&key_bytes) else {
+            return false;
+        };
+        let Some(signature_bytes) = decode_hex_exact::<64>(&envelope.signature) else {
+            return false;
+        };
+        let signature = Signature::from_bytes(&signature_bytes);
+
+        let payload = EvidencePayloadMirror {
+            version: EVIDENCE_SIG_VERSION,
+            agent_id: &self.agent_id,
+            session_id: None,
+            hit_ids: body
+                .results
+                .iter()
+                .map(|hit| hit.id.clone().unwrap_or_default())
+                .collect(),
+            hit_content_digests: body
+                .results
+                .iter()
+                .map(|hit| sha256_hex(hit.content.as_deref().unwrap_or_default().as_bytes()))
+                .collect(),
+        };
+        let Ok(bytes) = aeon_nexus_bridge::canonical_bytes(&payload) else {
+            return false;
+        };
+        verifying_key.verify(&bytes, &signature).is_ok()
     }
 
     fn management_key(&self) -> Option<&str> {
@@ -1314,6 +1408,25 @@ pub async fn recall_memory_evidence_v1(
     }
 }
 
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decode an even-length hex string into an exact-size array.
+fn decode_hex_exact<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    let hex = hex.trim();
+    if hex.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_nibble(chunk[0])?;
+        let lo = hex_nibble(chunk[1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1354,6 +1467,29 @@ struct SearchRequest<'a> {
 struct SearchResponse {
     #[serde(default)]
     results: Vec<SearchHit>,
+    /// Ed25519 counter-signature envelope (AEON-IQ `attestation.rs`).
+    #[serde(default)]
+    evidence: Option<EvidenceEnvelopeWire>,
+}
+
+#[derive(Deserialize)]
+struct EvidenceEnvelopeWire {
+    version: String,
+    key_id: String,
+    signature: String,
+    #[allow(dead_code)]
+    payload_digest: String,
+}
+
+/// Byte-exact mirror of AEON-IQ's `attestation::EvidencePayload` — field
+/// names and optionality are part of the signature contract.
+#[derive(Serialize)]
+struct EvidencePayloadMirror<'a> {
+    version: &'a str,
+    agent_id: &'a str,
+    session_id: Option<&'a str>,
+    hit_ids: Vec<String>,
+    hit_content_digests: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1510,7 +1646,7 @@ mod tests {
 
     static AEON_ENV_LOCK: Mutex<()> = Mutex::new(());
     static EGRESS_ENV_LOCK: Mutex<()> = Mutex::new(());
-    const AEON_ENV_VARS: [&str; 10] = [
+    const AEON_ENV_VARS: [&str; 11] = [
         ENABLED_ENV,
         BASE_URL_ENV,
         AGENT_ID_ENV,
@@ -1518,6 +1654,7 @@ mod tests {
         TIMEOUT_MS_ENV,
         MANAGEMENT_KEY_ENV,
         HMAC_KEY_ENV,
+        VERIFYING_KEY_ENV,
         TIMELINE_SPOOL_ENV,
         "NEXUS_EGRESS_ALLOWLIST",
         "NEXUS_EGRESS_ALLOW_PRIVATE",
@@ -1872,11 +2009,133 @@ mod tests {
             timeout_ms: 100,
             management_key: management_key.map(str::to_string),
             hmac_key: None,
+            verifying_key: None,
         }
     }
 
     fn generated_test_management_key() -> String {
         format!("test-mgmt-{}", uuid::Uuid::new_v4())
+    }
+
+    /// Build a client with a pinned verifying key and a responder that
+    /// returns `body`.
+    fn verifying_mock_client(signing_seed: [u8; 32], body: String) -> AeonMemoryClient {
+        use ed25519_dalek::SigningKey;
+        let vk = SigningKey::from_bytes(&signing_seed)
+            .verifying_key()
+            .to_bytes();
+        with_clean_aeon_env(|| {
+            let mut config = test_config("http://aeon.test", Some("mgmt"));
+            config.verifying_key = Some(vk);
+            AeonMemoryClient::with_test_responder(
+                &config,
+                Arc::new(move |_request| TestHttpResponse {
+                    status: 200,
+                    body: body.clone(),
+                }),
+            )
+        })
+    }
+
+    /// Sign a hit set exactly as AEON-IQ's attestation.rs does and return the
+    /// full search-response JSON body.
+    fn signed_search_body(signing_seed: [u8; 32], agent_id: &str, hits: &[(&str, &str)]) -> String {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&signing_seed);
+        let payload = EvidencePayloadMirror {
+            version: EVIDENCE_SIG_VERSION,
+            agent_id,
+            session_id: None,
+            hit_ids: hits.iter().map(|(id, _)| id.to_string()).collect(),
+            hit_content_digests: hits
+                .iter()
+                .map(|(_, content)| sha256_hex(content.as_bytes()))
+                .collect(),
+        };
+        let bytes = aeon_nexus_bridge::canonical_bytes(&payload).unwrap();
+        let signature = key.sign(&bytes);
+        let results: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|(id, content)| {
+                serde_json::json!({"id": id, "content": content, "similarity": 0.9})
+            })
+            .collect();
+        serde_json::json!({
+            "results": results,
+            "evidence": {
+                "version": EVIDENCE_SIG_VERSION,
+                "key_id": hex_lower(&key.verifying_key().to_bytes()),
+                "signature": hex_lower(&signature.to_bytes()),
+                "payload_digest": sha256_hex(&bytes),
+            }
+        })
+        .to_string()
+    }
+
+    /// With a verifying key configured, a correctly counter-signed response
+    /// yields verified hits and AttestedWithRecall.
+    #[tokio::test]
+    async fn verified_counter_signature_attests_recall() {
+        let seed = [9u8; 32];
+        let body = signed_search_body(seed, "agent-1", &[("id-1", "hello world")]);
+        let client = verifying_mock_client(seed, body);
+
+        let outcome = client.search_with_status("query", 5).await;
+        assert_eq!(outcome.hits.len(), 1);
+        assert_eq!(outcome.hits[0].content, "hello world");
+        assert_eq!(
+            outcome.attestation,
+            crate::proof::schema::MemoryAttestationMode::AttestedWithRecall
+        );
+    }
+
+    /// Altering hit content after signing (tampering) must degrade the
+    /// outcome and drop the hits.
+    #[tokio::test]
+    async fn tampered_hits_degrade_and_drop() {
+        let seed = [9u8; 32];
+        let body = signed_search_body(seed, "agent-1", &[("id-1", "hello world")])
+            .replace("hello world", "poisoned!!!");
+        let client = verifying_mock_client(seed, body);
+
+        let outcome = client.search_with_status("query", 5).await;
+        assert!(outcome.hits.is_empty(), "tampered hits must be dropped");
+        assert_eq!(
+            outcome.attestation,
+            crate::proof::schema::MemoryAttestationMode::Degraded
+        );
+    }
+
+    /// A response missing the evidence envelope entirely is unverifiable when
+    /// a key is pinned.
+    #[tokio::test]
+    async fn missing_envelope_degrades_when_key_pinned() {
+        let seed = [9u8; 32];
+        let body = r#"{"results":[{"id":"id-1","content":"hello","similarity":0.9}]}"#.to_string();
+        let client = verifying_mock_client(seed, body);
+
+        let outcome = client.search_with_status("query", 5).await;
+        assert!(outcome.hits.is_empty());
+        assert_eq!(
+            outcome.attestation,
+            crate::proof::schema::MemoryAttestationMode::Degraded
+        );
+    }
+
+    /// A signature from the wrong key must not verify.
+    #[tokio::test]
+    async fn wrong_key_signature_degrades() {
+        let attacker_seed = [13u8; 32];
+        let pinned_seed = [9u8; 32];
+        let body = signed_search_body(attacker_seed, "agent-1", &[("id-1", "hello")]);
+        let client = verifying_mock_client(pinned_seed, body);
+
+        let outcome = client.search_with_status("query", 5).await;
+        assert!(outcome.hits.is_empty());
+        assert_eq!(
+            outcome.attestation,
+            crate::proof::schema::MemoryAttestationMode::Degraded
+        );
     }
 
     impl TestHttpRequest {
@@ -1921,7 +2180,7 @@ mod tests {
 
     fn with_clean_aeon_env<R>(test: impl FnOnce() -> R + std::panic::UnwindSafe) -> R {
         let _guard = AEON_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let saved: [(&str, Option<OsString>); 10] =
+        let saved: [(&str, Option<OsString>); 11] =
             AEON_ENV_VARS.map(|name| (name, std::env::var_os(name)));
 
         for name in AEON_ENV_VARS {

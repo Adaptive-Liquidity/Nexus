@@ -575,6 +575,7 @@ mod tests {
                 timeout_ms: 30_000,
                 management_key: None,
                 hmac_key: None,
+                verifying_key: None,
             },
         )
         .unwrap();
@@ -634,6 +635,7 @@ mod tests {
                 timeout_ms: 30_000,
                 management_key: None,
                 hmac_key: None,
+                verifying_key: None,
             },
         )
         .unwrap();
@@ -694,6 +696,7 @@ mod tests {
             timeout_ms: 30_000,
             management_key: Some("mgmt-key".into()),
             hmac_key: None,
+            verifying_key: None,
         };
         let client = crate::aeon::AeonMemoryClient::with_test_responder(
             &aeon,
@@ -761,6 +764,7 @@ mod tests {
             timeout_ms: 30_000,
             management_key: None,
             hmac_key: None,
+            verifying_key: None,
         };
         let client = crate::aeon::AeonMemoryClient::with_test_responder(
             &aeon,

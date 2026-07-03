@@ -109,6 +109,7 @@ fn unreachable_aeon_config() -> AeonConfig {
         timeout_ms: 1,
         management_key: Some(format!("test-management-key-{}", Uuid::new_v4())),
         hmac_key: None,
+        verifying_key: None,
     }
 }
 

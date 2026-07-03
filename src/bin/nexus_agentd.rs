@@ -1326,6 +1326,7 @@ mod proof_tests {
                 timeout_ms: 1,
                 management_key: Some("mgmt-key".to_string()),
                 hmac_key: Some(vec![0x11, 0x22, 0x33]),
+                verifying_key: None,
             }),
             ..HypervisorConfig::default()
         };

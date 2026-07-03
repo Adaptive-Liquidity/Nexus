@@ -1127,13 +1127,21 @@ impl NexusMcpServer {
             .map(|spec| parse_iq_capability(&spec))
             .collect::<Result<Vec<_>>>()?;
 
+        // The recall above ran in this process: with a verifying key
+        // configured, Attested* modes imply the Ed25519 counter-signature
+        // verified (search_with_status degrades otherwise).
+        let memory_verified = memory_digest.is_some()
+            && aeon_config
+                .as_ref()
+                .is_some_and(|config| config.verifying_key.is_some());
         let tool = ToolDefinition::new(params.tool_name, wasm_bytes)
             .with_capabilities(required_capabilities.clone())
             .with_aeon_context(
                 Some(params.aeon_agent_id.clone()),
                 params.aeon_session_id.clone(),
             )
-            .with_aeon_memory_evidence_digest(memory_digest.clone());
+            .with_aeon_memory_evidence_digest(memory_digest.clone())
+            .with_aeon_memory_evidence_verified(memory_verified);
 
         let execution = if required_capabilities.is_empty() {
             self.hypervisor.execute_tool_proof(tool, input).await

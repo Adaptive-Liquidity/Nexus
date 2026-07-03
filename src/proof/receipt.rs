@@ -80,4 +80,13 @@ pub struct ExecutionReceipt {
     #[cfg(feature = "aeon-memory")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aeon_memory_evidence_digest: Option<String>,
+    /// True only when the recall that produced `aeon_memory_evidence_digest`
+    /// carried an AEON-IQ Ed25519 counter-signature that THIS process
+    /// verified (`NEXUS_AEON_VERIFYING_KEY` configured and signature valid).
+    /// Deliberately not settable through the daemon wire protocol — an
+    /// untrusted daemon caller must not be able to claim verification it
+    /// did not perform.
+    #[cfg(feature = "aeon-memory")]
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub aeon_memory_evidence_verified: bool,
 }

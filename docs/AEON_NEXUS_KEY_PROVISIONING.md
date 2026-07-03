@@ -2,12 +2,16 @@
 
 **Status:** Phase 10 release hardening
 
-Nexus uses two AEON-IQ integration secrets:
+Nexus uses three AEON-IQ integration key materials:
 
-- `NEXUS_AEON_MANAGEMENT_KEY`: authorizes calls to AEON-IQ management endpoints.
-- `NEXUS_AEON_HMAC_KEY`: binds AEON-IQ memory evidence into Nexus proof capsules.
+- `NEXUS_AEON_MANAGEMENT_KEY` (secret): authorizes calls to AEON-IQ management endpoints.
+- `NEXUS_AEON_HMAC_KEY` (secret): binds AEON-IQ memory evidence into Nexus proof capsules.
+- `NEXUS_AEON_VERIFYING_KEY` (public): AEON-IQ's Ed25519 evidence verifying key.
+  When set, Nexus verifies the counter-signature AEON-IQ attaches to every
+  memory-search response and only reports `Attested*` memory modes on success;
+  a missing or invalid signature drops the hits and degrades the outcome.
 
-They are separate keys. Do not reuse one value for both.
+They are separate key materials. Do not reuse one value for another.
 
 ## Generate Keys
 
@@ -36,6 +40,31 @@ export NEXUS_AEON_HMAC_KEY="$AEON_NEXUS_HMAC_KEY_HEX"
 ```
 
 AEON-IQ's exact HMAC environment variable name is deployment-owned, but it must receive the same HMAC key used by Nexus so AEON-IQ timeline/evidence rows can be verified against Nexus proof evidence.
+
+Provision the evidence-signature key pair:
+
+```bash
+# On the AEON-IQ side: a private Ed25519 seed (secret)
+export AEON_EVIDENCE_SIGNING_KEY="$(openssl rand -hex 32)"
+```
+
+Then read the corresponding public verifying key from AEON-IQ and pin it in
+Nexus (it is public material — safe to store in config management):
+
+```bash
+curl -s -H "X-Management-Key: $MANAGEMENT_API_KEY" \
+  "$AEON_BASE_URL/api/v1/evidence/verifying-key"
+# → {"version":"aeon-evidence-sig-v1","key_id":"<64-hex>","persistent":true}
+export NEXUS_AEON_VERIFYING_KEY="<key_id from the response>"
+```
+
+Do not pin a key reported with `"persistent": false` — that is an ephemeral
+key that changes on every AEON-IQ restart (AEON_EVIDENCE_SIGNING_KEY unset).
+
+Rotation: generate a new seed, restart AEON-IQ, re-read the verifying key,
+update `NEXUS_AEON_VERIFYING_KEY`, restart Nexus consumers. During the window
+between AEON-IQ and Nexus restarts, verification fails closed (hits dropped,
+`Degraded` attestation) — schedule both restarts together.
 
 Keys must be injected through the process environment or the deployment secret manager. Never commit keys, hardcode them in Rust, include them in examples with real values, or log them above debug. Debug logs should still avoid printing key material.
 

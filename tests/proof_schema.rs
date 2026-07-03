@@ -127,6 +127,8 @@ fn sample_receipt() -> ExecutionReceipt {
         negotiation_rounds: None,
         #[cfg(feature = "aeon-memory")]
         aeon_memory_evidence_digest: None,
+        #[cfg(feature = "aeon-memory")]
+        aeon_memory_evidence_verified: false,
     }
 }
 

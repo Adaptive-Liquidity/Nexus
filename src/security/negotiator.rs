@@ -210,6 +210,7 @@ mod tests {
             timeout_ms: 100,
             management_key: management_key.map(str::to_string),
             hmac_key: None,
+            verifying_key: None,
         }
     }
 

@@ -76,6 +76,12 @@ pub struct ToolDefinition {
     #[cfg(feature = "aeon-memory")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aeon_memory_evidence_digest: Option<String>,
+    /// True only when the in-process recall that produced the evidence digest
+    /// verified AEON-IQ's Ed25519 counter-signature (see
+    /// `ExecutionReceipt::aeon_memory_evidence_verified`).
+    #[cfg(feature = "aeon-memory")]
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub aeon_memory_evidence_verified: bool,
 }
 
 impl ToolDefinition {
@@ -92,6 +98,8 @@ impl ToolDefinition {
             aeon_session_id: None,
             #[cfg(feature = "aeon-memory")]
             aeon_memory_evidence_digest: None,
+            #[cfg(feature = "aeon-memory")]
+            aeon_memory_evidence_verified: false,
         }
     }
 
@@ -116,6 +124,12 @@ impl ToolDefinition {
     ) -> Self {
         self.aeon_agent_id = agent_id;
         self.aeon_session_id = session_id;
+        self
+    }
+
+    #[cfg(feature = "aeon-memory")]
+    pub fn with_aeon_memory_evidence_verified(mut self, verified: bool) -> Self {
+        self.aeon_memory_evidence_verified = verified;
         self
     }
 
@@ -707,6 +721,8 @@ impl NexusHypervisor {
             negotiation_rounds: None,
             #[cfg(feature = "aeon-memory")]
             aeon_memory_evidence_digest: tool.aeon_memory_evidence_digest.clone(),
+            #[cfg(feature = "aeon-memory")]
+            aeon_memory_evidence_verified: tool.aeon_memory_evidence_verified,
         };
 
         let capsule = self.capsule_from_receipt(&receipt, &output, &input_bytes);
@@ -827,6 +843,7 @@ impl NexusHypervisor {
             aeon_session_id: tool.aeon_session_id.clone(),
             negotiation_rounds,
             aeon_memory_evidence_digest: tool.aeon_memory_evidence_digest.clone(),
+            aeon_memory_evidence_verified: tool.aeon_memory_evidence_verified,
         };
 
         let capsule = if negotiation_rounds.is_some() {
@@ -1023,9 +1040,22 @@ impl NexusHypervisor {
         match self.memory_evidence_ref_from_digest(receipt) {
             Some(evidence) => {
                 capsule.memory_evidence = Some(evidence);
-                // C2: digest-only path cannot verify hit count or counter-signed receipt;
-                // Advisory correctly reflects that AEON context was present without full attestation.
-                capsule.memory_mode = Some(crate::proof::schema::MemoryAttestationMode::Advisory);
+                // C2 resolution: when the in-process recall verified AEON-IQ's
+                // Ed25519 counter-signature over the served hit set (verifying
+                // key configured + signature valid), the evidence is genuinely
+                // attested.  Digest-only daemon callers cannot set the verified
+                // flag, so their capsules remain Advisory.
+                let verified = receipt.aeon_memory_evidence_verified
+                    && self
+                        .config
+                        .aeon_config
+                        .as_ref()
+                        .is_some_and(|config| config.verifying_key.is_some());
+                capsule.memory_mode = Some(if verified {
+                    crate::proof::schema::MemoryAttestationMode::Attested
+                } else {
+                    crate::proof::schema::MemoryAttestationMode::Advisory
+                });
             }
             None => {
                 capsule.memory_mode = Some(crate::proof::schema::MemoryAttestationMode::Degraded);
@@ -2227,6 +2257,8 @@ mod tests {
             negotiation_rounds: None,
             #[cfg(feature = "aeon-memory")]
             aeon_memory_evidence_digest: None,
+            #[cfg(feature = "aeon-memory")]
+            aeon_memory_evidence_verified: false,
         };
 
         let output = ToolOutput {
@@ -2294,6 +2326,8 @@ mod tests {
             negotiation_rounds: None,
             #[cfg(feature = "aeon-memory")]
             aeon_memory_evidence_digest: None,
+            #[cfg(feature = "aeon-memory")]
+            aeon_memory_evidence_verified: false,
         }
     }
 
@@ -2386,6 +2420,7 @@ mod tests {
             timeout_ms: 30_000,
             management_key: management_key.map(str::to_string),
             hmac_key: None,
+            verifying_key: None,
         }
     }
 
