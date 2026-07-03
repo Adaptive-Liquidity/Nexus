@@ -301,6 +301,30 @@ pub struct NexusHypervisor {
     aeon_memory: Option<crate::aeon::AeonMemoryClient>,
 }
 
+/// When an AEON Ed25519 verifying key is configured (`verification_required`),
+/// Ed25519 verification is the only path allowed to assert `Attested` /
+/// `AttestedWithRecall` / `AttestedNoHit` (see the C2 resolution note on
+/// `attach_memory_evidence_from_receipt`). Callers that construct a mode
+/// without going through that verification — e.g. the legacy HMAC-based
+/// `build_memory_evidence_ref` used for negotiation-round hits — must have
+/// any Attested* claim downgraded to `Advisory` so an unverified hit set can
+/// never look cryptographically attested in the signed capsule. Extracted as
+/// a pure function so the capping rule is unit-testable without constructing
+/// a full hypervisor.
+#[cfg(feature = "aeon-memory")]
+fn cap_unverified_memory_mode(
+    mode: crate::proof::schema::MemoryAttestationMode,
+    verification_required: bool,
+) -> crate::proof::schema::MemoryAttestationMode {
+    use crate::proof::schema::MemoryAttestationMode::*;
+
+    if verification_required && matches!(mode, Attested | AttestedWithRecall | AttestedNoHit) {
+        Advisory
+    } else {
+        mode
+    }
+}
+
 impl NexusHypervisor {
     /// Create a new hypervisor with the default `StaticPolicy` recovery
     /// policy. For custom policies use `new_with_policy`.
@@ -1018,11 +1042,25 @@ impl NexusHypervisor {
             &self.config.proof_hmac_key,
         );
         let attached_from_receipt = self.attach_memory_evidence_from_receipt(&mut capsule, receipt);
+        // memory_mode here comes from build_memory_evidence_ref (the legacy
+        // HMAC-based path used for negotiation-round hits), which has no
+        // concept of the Ed25519 counter-signature C2 introduced — it claims
+        // AttestedWithRecall/AttestedNoHit purely from HMAC-key presence.
+        // Cap it the same way attach_memory_evidence_from_receipt already
+        // caps digest-only callers, so a negotiated capsule can never claim
+        // Attested* for hits that were never actually signature-verified.
+        let verification_required = self
+            .config
+            .aeon_config
+            .as_ref()
+            .is_some_and(|config| config.verifying_key.is_some());
+        let capped_mode =
+            memory_mode.map(|mode| cap_unverified_memory_mode(mode, verification_required));
         if memory_evidence.is_some() {
             capsule.memory_evidence = memory_evidence;
-            capsule.memory_mode = memory_mode;
+            capsule.memory_mode = capped_mode;
         } else if !attached_from_receipt {
-            capsule.memory_mode = memory_mode;
+            capsule.memory_mode = capped_mode;
         }
         sign_capsule(capsule, &self.proof_signing_key)
     }
@@ -2166,6 +2204,58 @@ mod tests {
     use super::*;
     #[cfg(feature = "aeon-memory")]
     use std::{ffi::OsString, sync::Mutex};
+
+    /// Regression test for the negotiation-path bug: when a verifying key is
+    /// configured (Ed25519 verification is expected), the legacy HMAC-based
+    /// build_memory_evidence_ref mode must never be trusted at face value —
+    /// it has no concept of Ed25519 verification, so any Attested* claim it
+    /// makes gets capped to Advisory.
+    #[cfg(feature = "aeon-memory")]
+    #[test]
+    fn cap_unverified_memory_mode_downgrades_attested_when_verification_required() {
+        use crate::proof::schema::MemoryAttestationMode::*;
+
+        for mode in [Attested, AttestedWithRecall, AttestedNoHit] {
+            let label = format!("{mode:?}");
+            assert_eq!(
+                cap_unverified_memory_mode(mode, true),
+                Advisory,
+                "{label} must be capped to Advisory when verification is required"
+            );
+        }
+    }
+
+    /// When no verifying key is configured, legacy HMAC-based behavior is
+    /// unchanged — this is not a regression for deployments that don't use
+    /// Ed25519 attestation.
+    #[cfg(feature = "aeon-memory")]
+    #[test]
+    fn cap_unverified_memory_mode_passes_through_when_verification_not_required() {
+        use crate::proof::schema::MemoryAttestationMode::*;
+
+        for mode in [
+            Attested,
+            AttestedWithRecall,
+            AttestedNoHit,
+            Advisory,
+            Degraded,
+            Absent,
+        ] {
+            assert_eq!(cap_unverified_memory_mode(mode.clone(), false), mode);
+        }
+    }
+
+    /// Advisory/Degraded/Absent are never "upgraded" by the cap — the
+    /// function only ever downgrades, never elevates trust.
+    #[cfg(feature = "aeon-memory")]
+    #[test]
+    fn cap_unverified_memory_mode_leaves_non_attested_modes_alone() {
+        use crate::proof::schema::MemoryAttestationMode::*;
+
+        for mode in [Advisory, Degraded, Absent] {
+            assert_eq!(cap_unverified_memory_mode(mode.clone(), true), mode);
+        }
+    }
 
     #[cfg(feature = "aeon-memory")]
     static EGRESS_ENV_LOCK: Mutex<()> = Mutex::new(());

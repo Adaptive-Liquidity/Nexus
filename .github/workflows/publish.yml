@@ -41,16 +41,19 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
 
-      # Dockerfile.nexusiq builds the three kit binaries (nexus, nexus-agentd,
-      # nexus-mcp) with --features aeon-memory on digest-pinned bookworm bases.
-      # It is the same Dockerfile the Nexus-IQ kit vendors (docker/Dockerfile.nexus
-      # there); this copy is the canonical publish source.
+      # docker/Dockerfile.nexus builds the three kit binaries (nexus,
+      # nexus-agentd, nexus-mcp) with --features aeon-memory on digest-pinned
+      # bookworm bases. It is committed here (not gitignored) so this workflow
+      # is self-contained; the Nexus-IQ kit vendors an identical copy at the
+      # same path (see that file's header for the sync note). Do NOT point
+      # this at `Dockerfile.nexusiq` — that filename is a gitignored artifact
+      # install.sh generates locally and is never present in a fresh checkout.
       - name: Build and push Nexus image
         id: push
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile.nexusiq
+          file: ./docker/Dockerfile.nexus
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

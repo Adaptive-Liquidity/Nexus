@@ -1,0 +1,151 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.nexus — builds the three Nexus binaries with the `aeon-memory`
+# feature enabled.
+#
+# This is the canonical copy, committed here (not gitignored) so that this
+# repo's own `.github/workflows/publish.yml` can build and publish images on
+# `v*` tags without checking out a second repository. The Nexus-IQ self-host
+# kit vendors an identical copy at `docker/Dockerfile.nexus` there, which
+# `install.sh` copies into a local Nexus checkout as the gitignored
+# `Dockerfile.nexusiq` when building from source — keep both copies in sync on
+# any change (build args, COPY paths, base image digests).
+#
+# Build context is this repo's root (where Cargo.toml / Cargo.lock / src/ /
+# crates/ live), so every COPY path below is relative to it.
+#
+# Produced binaries (copied to /usr/local/bin in the runtime image):
+#   - nexus          (CLI / orchestrator)
+#   - nexus-agentd   (long-lived daemon; default CMD)
+#   - nexus-mcp      (STDIO MCP server; invoked via `docker compose run`)
+
+# ── Build stage ───────────────────────────────────────────────────────────────
+# Pin to a toolchain new enough for the Nexus dependency tree. wasmtime 45's
+# cranelift deps require the `edition2024` cargo feature (Rust >= 1.85), so the
+# builder must be recent. 1.96 matches the AEON-IQ image's proven base.
+# Digest pin of rust:1.96-slim-bookworm (reproducible release builds).
+# MUST be the -bookworm variant: the bare rust:1.96-slim tag now resolves to a
+# Debian trixie base (glibc 2.41), and binaries it produces fail at runtime on
+# debian:bookworm-slim (glibc 2.36) with `GLIBC_2.39 not found`. Keeping the
+# builder on bookworm matches the runtime glibc exactly.
+FROM rust@sha256:c8a94a78f67ec8c4d474ec7f71e0720f21eb7e584e158daec0874cafa7c30e4d AS builder
+
+# Native build dependencies. ed25519-dalek + reqwest(rustls) compile fine, but
+# the `aeon-memory` feature pulls in TLS-adjacent crates that expect pkg-config
+# and OpenSSL headers to be present during the build.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Cap parallel codegen so the large dependency tree (wasmtime) cannot exhaust
+# memory on smaller hosts / WSL VMs. Override at build time with
+# `--build-arg CARGO_BUILD_JOBS=N` (raise on big machines, lower on constrained).
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
+# ── Dependency pre-build (layer cache) ────────────────────────────────────────
+# Copy only the manifests + the workspace member manifest first, synthesize
+# dummy entrypoints for every [[bin]] target, and compile dependencies. This
+# layer is reused on subsequent builds whenever Cargo.toml / Cargo.lock and the
+# bridge crate manifest are unchanged, so source-only edits skip the (expensive)
+# dependency compile.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/aeon_nexus_bridge/Cargo.toml crates/aeon_nexus_bridge/Cargo.toml
+
+RUN set -eux; \
+    mkdir -p src/bin crates/aeon_nexus_bridge/src; \
+    echo 'fn main() {}' > src/main.rs; \
+    echo 'fn main() {}' > src/bin/nexus_agentd.rs; \
+    echo 'fn main() {}' > src/bin/nexus_mcp.rs; \
+    # lib.rs is required because main.rs / the bins reference `nexus::...`.
+    echo '' > src/lib.rs; \
+    echo '' > crates/aeon_nexus_bridge/src/lib.rs; \
+    # Every declared [[bench]]/[[example]] target file must exist or Cargo
+    # refuses to PARSE the manifest — even for a --bin-only build. Synthesize
+    # dummies so the dependency-cache layer compiles without the real tree.
+    mkdir -p benches examples/wasi_capability_demo; \
+    echo 'fn main() {}' > benches/nexus_validation.rs; \
+    echo 'fn main() {}' > benches/nexus_iq_bench.rs; \
+    echo 'fn main() {}' > benches/density_validation.rs; \
+    echo 'fn main() {}' > examples/wasi_capability_demo/host.rs; \
+    echo 'fn main() {}' > examples/aeon_e2e_demo.rs; \
+    cargo build --release --locked --features aeon-memory \
+        --bin nexus --bin nexus-agentd --bin nexus-mcp; \
+    # Drop the dummy artifacts so the real sources trigger a recompile.
+    rm -rf src crates/aeon_nexus_bridge/src benches examples \
+        target/release/nexus target/release/nexus-agentd target/release/nexus-mcp \
+        target/release/deps/nexus-* \
+        target/release/deps/aeon_nexus_bridge-*
+
+# ── Real build ────────────────────────────────────────────────────────────────
+# Bring in the full source tree and build the actual binaries. --locked keeps
+# the dependency graph identical to the committed Cargo.lock.
+COPY . .
+
+RUN cargo build --release --locked --features aeon-memory \
+        --bin nexus --bin nexus-agentd --bin nexus-mcp
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+# Digest pin of debian:bookworm-slim (reproducible release builds).
+FROM debian@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+
+ARG NEXUS_VERSION=1.0.0
+LABEL org.opencontainers.image.title="NexusIQ Nexus runtime" \
+      org.opencontainers.image.description="Sandboxed WASM execution daemon + MCP server + CLI for NexusIQ" \
+      org.opencontainers.image.source="https://github.com/adaptiveliquidity/nexusiq" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${NEXUS_VERSION}"
+
+# ca-certificates: outbound TLS to the AEON proxy / upstream providers.
+# libssl3: runtime for the OpenSSL-linked crates.
+# curl: used by container healthchecks / debugging.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libssl3 \
+        curl \
+        gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 10001 nexus \
+    && useradd --uid 10001 --gid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin --no-create-home nexus
+
+COPY --from=builder /app/target/release/nexus        /usr/local/bin/nexus
+COPY --from=builder /app/target/release/nexus-agentd /usr/local/bin/nexus-agentd
+COPY --from=builder /app/target/release/nexus-mcp    /usr/local/bin/nexus-mcp
+
+# Runtime directories:
+#   /run/nexus — holds the agentd unix socket (shared via the agentd_run volume)
+#   /modules   — default module directory bind-mount target
+RUN mkdir -p /run/nexus /modules /data/proofs /data/timeline /data/logs \
+    && chown -R nexus:nexus /run/nexus /modules /data/proofs /data/timeline /data/logs
+
+RUN cat <<'EOF' > /usr/local/bin/nexusiq-entrypoint.sh
+#!/bin/sh
+set -e
+
+is_read_only_mount() {
+    awk -v target="$1" '$2 == target && $4 ~ /(^|,)ro(,|$)/ { found = 1 } END { exit(found ? 0 : 1) }' /proc/mounts
+}
+
+if [ "$(id -u)" = "0" ]; then
+    for path in /run/nexus /modules /data/proofs /data/timeline /data/logs; do
+        if is_read_only_mount "$path"; then
+            continue
+        fi
+        chown -R nexus:nexus "$path"
+    done
+    exec gosu nexus:nexus "$@"
+fi
+
+exec "$@"
+EOF
+RUN chmod +x /usr/local/bin/nexusiq-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/nexusiq-entrypoint.sh"]
+
+# Long-lived daemon by default. The nexus-mcp service overrides this command
+# (it is STDIO-only and started on demand via `docker compose run`).
+CMD ["nexus-agentd", "--socket", "/run/nexus/nexus-agentd.sock"]
