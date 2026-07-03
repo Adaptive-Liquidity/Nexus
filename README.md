@@ -71,6 +71,8 @@ cd Nexus
 cargo build --release
 ```
 
+A prebuilt, cosign-signed image (built from `docker/Dockerfile.nexus` with the `aeon-memory` feature) is published to `ghcr.io/adaptiveliquidity/nexusiq-nexus` on tagged releases — mainly consumed by the [Nexus-IQ self-host kit](https://github.com/adaptiveliquidity/Nexus-IQ), but usable standalone via `docker pull`.
+
 ### Pure-Compute Execution
 
 ```rust
@@ -245,6 +247,7 @@ The `aeon-memory` feature wires Nexus to AEON-IQ as a persistent memory plane. W
 
 - **Memory attestation** — each execution receipt carries a `memory_mode` field (`Attested`, `AttestedWithRecall`, `Advisory`, or `Absent`) that records whether the capsule digest was bound to a verified AEON-IQ memory hit.
 - **Evidence digests** — `MemoryEvidenceV1` bundles contain per-hit SHA-256 digests and, when `NEXUS_AEON_HMAC_KEY` is set, an HMAC-SHA256 digest over the full evidence body that AEON-IQ can independently verify.
+- **Ed25519 counter-signature verification** — when `NEXUS_AEON_VERIFYING_KEY` is set, every AEON-IQ search response's hit set must carry a valid Ed25519 counter-signature or the hits are dropped and attestation degrades. Verified evidence flips `memory_mode` from `Advisory` to `Attested`/`AttestedWithRecall`; this is what closes the "self-issued evidence" gap in the threat model (see [docs/AEON_NEXUS_KEY_PROVISIONING.md](docs/AEON_NEXUS_KEY_PROVISIONING.md) for how to provision and pin the key).
 - **Timeline chain** — execution events are forwarded to the AEON-IQ timeline endpoint; a local spool (`NEXUS_AEON_TIMELINE_SPOOL`) buffers events during outages and replays them on restart.
 
 ### Build
@@ -261,6 +264,7 @@ cargo build --release --features aeon-memory
 |----------|----------|-------------|
 | `NEXUS_AEON_BASE_URL` | Yes | AEON-IQ service URL (http or https). Defaults to `http://localhost:8080`. |
 | `NEXUS_AEON_HMAC_KEY` | **Production: mandatory** | Hex-encoded HMAC-SHA256 shared secret (minimum 32 bytes / 64 hex chars). Without it, `memory_digest` falls back to unauthenticated SHA-256 — forgeable. Set in all production deployments. |
+| `NEXUS_AEON_VERIFYING_KEY` | Recommended | Hex-encoded Ed25519 public key (32 bytes) matching AEON-IQ's `AEON_EVIDENCE_SIGNING_KEY`. When set, AEON-IQ's counter-signature over each search response's hit set is verified before `Attested*` modes are reported; when unset, evidence stays `Advisory` regardless of HMAC presence. Fetch the current key from AEON-IQ's `GET /api/v1/evidence/verifying-key`. |
 | `NEXUS_AEON_MANAGEMENT_KEY` | Optional | Management API key for AEON-IQ administrative endpoints. |
 | `NEXUS_AEON_AGENT_ID` | Optional | Agent identifier forwarded to AEON-IQ. Defaults to `nexus`. |
 | `NEXUS_AEON_SESSION_ID` | Optional | Session identifier for memory scoping. Auto-generated when omitted. |
@@ -293,6 +297,10 @@ nexus aeon verify-proof-capsule capsule.json
 
 # Replay locally spooled timeline events
 nexus aeon replay-events --agent-id nexus
+
+# Export a signed proof capsule as a DSSE envelope for external
+# in-toto / cosign-verify-blob tooling (signed with NEXUS_PROOF_SIGNING_KEY)
+nexus aeon export-dsse capsule.json --output capsule.dsse.json
 ```
 
 ### Security
